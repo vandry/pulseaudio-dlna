@@ -44,6 +44,24 @@ class PulseAudio(object):
         self.streams = []
         self.sinks = []
 
+        # We control starting and stopping of playback on devices by
+        # observing the number of streams playing on the device.
+        # If there is a PulseAudio module-combine-sink which has one
+        # of our sinks as a slave, we should count the streams that are
+        # playing on the combine sink when deciding whether to start or
+        # stop playback on our sink. To do this, we simulate that any
+        # stream that is playing on a combine sync is actually playing
+        # on each of its slaves instead.
+        #
+        # slave_map maps object_pathes of module-combine-sink to a set
+        # of PulseSink objects representing the slaves of those sinks.
+        #
+        # NOTE: We only follow one level of combine-sink with slaves, as
+        # it is the easiest way to avoid chasing a cycle.
+        # If there is a combine-sink which slaves to another combine-sink,
+        # we won't know about it.
+        self.slave_map = {}
+
         self.fallback_sink = None
         self.system_sinks = []
 
@@ -120,7 +138,11 @@ class PulseAudio(object):
             for stream in self.streams:
                 for sink in self.sinks:
                     if sink.object_path == stream.device:
-                        sink.streams.append(stream)
+                        if sink.object_path in self.slave_map:
+                            for slave in self.slave_map[sink.object_path]:
+                                slave.streams.append(stream)
+                        else:
+                            sink.streams.append(stream)
         else:
             logger.error(
                 'Could not update sinks and streams. This normally indicates '
@@ -143,6 +165,7 @@ class PulseAudio(object):
             return False
 
     def update_sinks(self):
+        sinks_by_name = {}
         try:
             sink_paths = self.core.Get(
                 'org.PulseAudio.Core1', 'Sinks',
@@ -154,9 +177,19 @@ class PulseAudio(object):
                 if sink:
                     sink.fallback_sink = self.fallback_sink
                     self.sinks.append(sink)
-            return True
+                    sinks_by_name[sink.name] = sink
         except dbus.exceptions.DBusException:
             return False
+        self.slave_map = {}
+        for sink in self.sinks:
+            if sink.combine_slaves:
+                slaves = filter(None, (
+                    sinks_by_name.get(s, None)
+                    for s in sink.combine_slaves
+                ))
+                if slaves:
+                    self.slave_map[sink.object_path] = slaves
+        return True
 
     def create_null_sink(self, sink_name, sink_description):
         cmd = [
@@ -310,6 +343,7 @@ class PulseSinkFactory(PulseBaseFactory):
 
             properties = obj.Get('org.PulseAudio.Core1.Device', 'PropertyList')
             description_bytes = properties.get('device.description', [])
+            combine_slaves_bytes = properties.get('combine.slaves', [])
             module_path = unicode(
                 obj.Get('org.PulseAudio.Core1.Device', 'OwnerModule'))
 
@@ -319,6 +353,7 @@ class PulseSinkFactory(PulseBaseFactory):
                 name=unicode(obj.Get('org.PulseAudio.Core1.Device', 'Name')),
                 label=self._convert_bytes_to_unicode(description_bytes),
                 module=PulseModuleFactory.new(bus, module_path),
+                combine_slaves=self._convert_bytes_to_unicode(combine_slaves_bytes),
             )
         except dbus.exceptions.DBusException:
             logger.error(
@@ -333,7 +368,7 @@ class PulseSink(object):
     __shared_state = {}
 
     def __init__(self, object_path, index, name, label, module,
-                 fallback_sink=None):
+                 combine_slaves, fallback_sink=None):
         if object_path not in self.__shared_state:
             self.__shared_state[object_path] = {}
         self.__dict__ = self.__shared_state[object_path]
@@ -344,6 +379,10 @@ class PulseSink(object):
         self.label = label or name
         self.module = module
         self.fallback_sink = fallback_sink
+        if combine_slaves:
+            self.combine_slaves = frozenset(combine_slaves.split(','))
+        else:
+            self.combine_slaves = frozenset()
 
         self.monitor = self.name + '.monitor'
         self.streams = []
@@ -691,6 +730,15 @@ class PulseWatcher(PulseAudio):
             logger.info('{sink_path} was blocked!'.format(sink_path=sink_path))
             return
 
+        if sink_path in self.slave_map:
+            for slave in self.slave_map[sink_path]:
+                self.__handle_slave_sink_update(slave.object_path)
+        else:
+            self.__handle_slave_sink_update(sink_path)
+
+        return False
+
+    def __handle_slave_sink_update(self, sink_path):
         for bridge in self.bridges:
             logger.debug('\n{}'.format(bridge))
             if bridge.device.state == bridge.device.PLAYING:
